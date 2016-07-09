@@ -35,7 +35,7 @@ from r2.models.account import register, AccountExists
 
 
 def handle_login(
-    controller, form, responder, user, rem=None, **kwargs
+    controller, form, responder, user, rem=None, signature=None, **kwargs
 ):
     def _event(error):
         g.events.login_event(
@@ -43,8 +43,13 @@ def handle_login(
             error_msg=error,
             user_name=request.urlvars.get('url_user'),
             remember_me=rem,
+            signature=signature,
             request=request,
             context=c)
+
+    if signature and not signature.is_valid():
+        _event(error="SIGNATURE")
+        abort(403)
 
     hook_error = hooks.get_hook("account.login").call_until_return(
         responder=responder,
@@ -78,10 +83,11 @@ def handle_login(
         controller._login(responder, user, rem)
         _event(error=None)
 
+
 def handle_register(
     controller, form, responder, name, email,
     password, rem=None, newsletter_subscribe=False,
-    sponsor=False, **kwargs
+    sponsor=False, signature=None, **kwargs
 ):
 
     def _event(error):
@@ -92,8 +98,13 @@ def handle_register(
             email=request.POST.get('email'),
             remember_me=rem,
             newsletter=newsletter_subscribe,
+            signature=signature,
             request=request,
             context=c)
+
+    if signature and not signature.is_valid():
+        _event(error="SIGNATURE")
+        abort(403)
 
     if responder.has_errors('user', errors.USERNAME_TOO_SHORT):
         _event(error='USERNAME_TOO_SHORT')

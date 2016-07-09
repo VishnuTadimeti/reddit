@@ -21,6 +21,8 @@
 ###############################################################################
 from r2.tests import RedditControllerTestCase
 from r2.lib.errors import error_list
+from r2.lib.unicode import _force_unicode
+from r2.models import Subreddit
 from common import LoginRegBase
 
 
@@ -31,22 +33,9 @@ class PostLoginRegTests(LoginRegBase, RedditControllerTestCase):
     }
 
     def setUp(self):
-        RedditControllerTestCase.setUp(self)
-        LoginRegBase.setUp(self)
+        super(PostLoginRegTests, self).setUp()
+        self.autopatch(Subreddit, "_byID", return_value=[])
         self.dest = "/foo"
-
-    def find_headers(self, res, name):
-        for k, v in res.headers:
-            if k == name.lower():
-                yield v
-
-    def assert_headers(self, res, name, test):
-        for value in self.find_headers(res, name):
-            if callable(test) and test(value):
-                return
-            elif value == test:
-                return
-        raise AssertionError("No matching %s header found" % name)
 
     def assert_success(self, res):
         # On sucess, we redirect the user to the provided "dest" parameter
@@ -69,7 +58,7 @@ class PostLoginRegTests(LoginRegBase, RedditControllerTestCase):
         self.assertEqual(res.status, 200)
         # recaptcha is done entirely in JS
         if code != "BAD_CAPTCHA":
-            self.assertTrue(error_list[code] in res.body)
+            self.assertTrue(error_list[code] in _force_unicode(res.body))
 
     def make_qs(self, **kw):
         kw['dest'] = self.dest

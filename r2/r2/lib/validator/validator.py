@@ -53,6 +53,7 @@ from r2.models.promo import Location
 from r2.lib.authorize import Address, CreditCard
 from r2.lib.utils import constant_time_compare
 from r2.lib.require import require, require_split, RequirementException
+from r2.lib import signing
 
 from r2.lib.errors import errors, RedditError, UserRequiredException
 from r2.lib.errors import VerifiedUserRequiredException
@@ -833,7 +834,7 @@ class VSubredditRule(Validator):
             self.set_error(errors.SR_RULE_DOESNT_EXIST)
         else:
             return rule
-        
+
 
 class VAccountByName(VRequired):
     def __init__(self, param, error = errors.USER_DOESNT_EXIST, *a, **kw):
@@ -1204,20 +1205,22 @@ class VCanDistinguish(VByName):
             item = VByName.run(self, thing_name)
 
             if item.author_id == c.user._id:
-                # will throw a legitimate 500 if this isn't a link or
-                # comment, because this should only be used on links and
-                # comments
+                if isinstance(item, Message) and c.user.employee:
+                    return True
                 subreddit = item.subreddit_slow
 
-                if how in ("yes", "no") and subreddit.can_distinguish(c.user):
+                if (how in ("yes", "no") and
+                        subreddit.can_distinguish(c.user)):
                     can_distinguish = True
-                elif how in ("special", "no") and c.user_special_distinguish:
+                elif (how in ("special", "no") and
+                        c.user_special_distinguish):
                     can_distinguish = True
-                elif how in ("admin", "no") and c.user.employee:
+                elif (how in ("admin", "no") and
+                        c.user.employee):
                     can_distinguish = True
 
                 if can_distinguish:
-                    # Don't allow distinguishing for users who are in timeout
+                    # Don't allow distinguishing for users in timeout
                     VNotInTimeout().run(target=item, subreddit=subreddit)
                     return can_distinguish
 
@@ -1697,18 +1700,19 @@ class VThrottledLogin(VRequired):
             if not ratelimit_exempt:
                 time_slice = ratelimit.get_timeslice(g.RL_RESET_SECONDS)
                 ratelimits = self.get_ratelimits(account)
+                now = int(time.time())
 
                 for rl, max_requests in ratelimits.iteritems():
                     try:
                         failed_logins = ratelimit.get_usage(str(rl), time_slice)
 
                         if failed_logins >= max_requests:
-                            self.seconds = time_slice.remaining
+                            self.seconds = time_slice.end - now
                             period_end = datetime.utcfromtimestamp(
                                 time_slice.end).replace(tzinfo=pytz.UTC)
-                            time = utils.timeuntil(period_end)
+                            remaining_text = utils.timeuntil(period_end)
                             self.set_error(
-                                errors.RATELIMIT, {'time': time},
+                                errors.RATELIMIT, {'time': remaining_text},
                                 field='ratelimit', code=429)
                             g.stats.event_count('login.throttle', rl.category)
                             return False
@@ -2061,7 +2065,8 @@ class VRatelimit(Validator):
                  error=errors.RATELIMIT, fatal=False, *a, **kw):
         self.rate_user = rate_user
         self.rate_ip = rate_ip
-        self.prefix = prefix
+        self.name = prefix
+        self.cache_prefix = "rl:%s" % self.name
         self.error = error
         self.fatal = fatal
         self.seconds = None
@@ -2075,28 +2080,28 @@ class VRatelimit(Validator):
             hook = hooks.get_hook("account.is_ratelimit_exempt")
             ratelimit_exempt = hook.call_until_return(account=c.user)
             if ratelimit_exempt:
-                self._record_event(self.prefix, 'exempted')
+                self._record_event(self.name, 'exempted')
                 return
 
         to_check = []
         if self.rate_user and c.user_is_loggedin:
             to_check.append('user' + str(c.user._id36))
-            self._record_event(self.prefix, 'check_user')
+            self._record_event(self.name, 'check_user')
         if self.rate_ip:
             to_check.append('ip' + str(request.ip))
-            self._record_event(self.prefix, 'check_ip')
+            self._record_event(self.name, 'check_ip')
 
-        r = g.cache.get_multi(to_check, self.prefix)
+        r = g.ratelimitcache.get_multi(to_check, prefix=self.cache_prefix)
         if r:
             expire_time = max(r.values())
             time = utils.timeuntil(expire_time)
 
-            g.log.debug("rate-limiting %s from %s" % (self.prefix, r.keys()))
+            g.log.debug("rate-limiting %s from %s" % (self.name, r.keys()))
             for key in r.keys():
                 if key.startswith('user'):
-                    self._record_event(self.prefix, 'user_limit_hit')
+                    self._record_event(self.name, 'user_limit_hit')
                 elif key.startswith('ip'):
-                    self._record_event(self.prefix, 'ip_limit_hit')
+                    self._record_event(self.name, 'ip_limit_hit')
 
             # when errors have associated field parameters, we'll need
             # to add that here
@@ -2116,23 +2121,30 @@ class VRatelimit(Validator):
                 self.set_error(self.error)
 
     @classmethod
-    def ratelimit(cls, rate_user = False, rate_ip = False, prefix = "rate_",
-                  seconds = None):
-        to_set = {}
+    def ratelimit(cls, rate_user=False, rate_ip=False, prefix="rate_",
+                  seconds=None):
+        name = prefix
+        cache_prefix = "rl:%s" % name
+
         if seconds is None:
             seconds = g.RL_RESET_SECONDS
-        expire_time = datetime.now(g.tz) + timedelta(seconds = seconds)
+
+        expire_time = datetime.now(g.tz) + timedelta(seconds=seconds)
+
+        to_set = {}
         if rate_user and c.user_is_loggedin:
             to_set['user' + str(c.user._id36)] = expire_time
-            cls._record_event(prefix, 'set_user_limit')
+            cls._record_event(name, 'set_user_limit')
+
         if rate_ip:
             to_set['ip' + str(request.ip)] = expire_time
-            cls._record_event(prefix, 'set_ip_limit')
-        g.cache.set_multi(to_set, prefix = prefix, time = seconds)
+            cls._record_event(name, 'set_ip_limit')
+
+        g.ratelimitcache.set_multi(to_set, prefix=cache_prefix, time=seconds)
 
     @classmethod
-    def _record_event(cls, prefix, event):
-        g.stats.event_count('VRatelimit.%s' % prefix, event, sample_rate=0.1)
+    def _record_event(cls, name, event):
+        g.stats.event_count('VRatelimit.%s' % name, event, sample_rate=0.1)
 
 
 class VRatelimitImproved(Validator):
@@ -2141,28 +2153,48 @@ class VRatelimitImproved(Validator):
     This is a newer version of VRatelimit that uses the ratelimit lib.
     """
 
-    KEY_PREFIX = 'ratelimit'
+    class RateLimit(ratelimit.RateLimit):
+        """A RateLimit with defaults specialized for VRatelimitImproved.
 
-    def __init__(self, prefix, max_usage, rate_user=False, rate_ip=False,
-                 error=errors.RATELIMIT, *a, **kw):
-        """
         Arguments:
-
-        prefix -- a string used to separate out ratelimits.  Set this to a
-                  unique value unless you have a very good reason not to.
-        max_usage -- the maximum number of times to allow the user or IP to
-                     perform this action in g.RL_RESET_SECONDS seconds.
-        rate_user -- should we limit the user account?
-        rate_ip -- should we limit the ip address?
-        (At least one of rate_user and rate_ip should be True for this function
-        to have any effect.)
-        error -- the error message to use when the limit is exceeded.
+            event_action: The type of the action the user took, for logging.
+            event_type: Part of the key in the rate limit cache.
+            limit: The RateLimit.limit value. Allowed hits per batch of seconds.
+            seconds: The RateLimit.seconds value. How may seconds per batch.
+            event_id_fn: Nullary function that derives an id from the current
+                context.
         """
-        self.max_usage = max_usage
-        self.rate_user = rate_user
-        self.rate_ip = rate_ip
-        self.prefix = prefix
+        sample_rate = 0.1
+
+        def __init__(self,
+                     event_action, event_type, limit, seconds, event_id_fn):
+            ratelimit.RateLimit.__init__(self)
+            self.event_name = 'VRatelimitImproved.' + event_action
+            self.event_type = event_type
+            self.event_id_fn = event_id_fn
+            self.limit = limit
+            self.seconds = seconds
+
+        @property
+        def key(self):
+            return 'ratelimit-%s-%s' % (self.event_type, self.event_id_fn())
+
+    def __init__(self, user_limit=None, ip_limit=None, error=errors.RATELIMIT,
+                 *a, **kw):
+        """
+        At least one of user_limit and ip_limit should be set for this function
+        to have any effect.
+
+        Arguments:
+            user_limit: RateLimit -- The per-user rate limit.
+            ip_limit: RateLimit -- The per-IP rate limit.
+            error -- the error message to use when the limit is exceeded.
+        """
+        self.user_limit = user_limit
+        self.ip_limit = ip_limit
         self.error = error
+
+        # _validatedForm passes self.seconds to the current form's javascript.
         self.seconds = None
         Validator.__init__(self, *a, **kw)
 
@@ -2174,53 +2206,64 @@ class VRatelimitImproved(Validator):
             hook = hooks.get_hook("account.is_ratelimit_exempt")
             ratelimit_exempt = hook.call_until_return(account=c.user)
             if ratelimit_exempt:
-                self._record_event(self.prefix, 'exempted')
                 return
 
-        if self.rate_user and c.user_is_loggedin:
-            self._check_usage('user', c.user._id36)
-        if self.rate_ip:
-            self._check_usage('ip', request.ip)
+        if self.user_limit and c.user_is_loggedin:
+            self._check_usage(self.user_limit)
 
-    def _check_usage(self, usage_type, key):
+        if self.ip_limit:
+            self._check_usage(self.ip_limit)
+
+    def _check_usage(self, rate_limit):
         """Check ratelimit usage and set an error if necessary."""
-        ratelimit_key = '%s-%s-%s' % (self.KEY_PREFIX, usage_type, key)
-        time_slice = ratelimit.get_timeslice(g.RL_RESET_SECONDS)
-        usage = ratelimit.get_usage(ratelimit_key, time_slice)
-        self._record_event(self.prefix, 'check_' + usage_type)
+        if rate_limit.check():
+            # Not rate limited.
+            return
 
-        if usage > self.max_usage:
-            g.log.debug('rate-limiting %s with %s used', ratelimit_key, usage)
-            self._record_event(self.prefix, '%s_limit_hit' % usage_type)
-
-            # When errors have associated field parameters, we'll need
-            # to add that here.
-            if self.error == errors.RATELIMIT:
-                period_end = datetime.utcfromtimestamp(
-                    time_slice.end).replace(tzinfo=pytz.UTC)
-                time = utils.timeuntil(period_end)
-                self.set_error(errors.RATELIMIT, {'time': time},
-                               field='ratelimit', code=429)
-            else:
-                self.set_error(self.error)
+        g.log.debug('rate-limiting %s with %s used',
+                    rate_limit.key, rate_limit.get_usage())
+        # When errors have associated field parameters, we'll need
+        # to add that here.
+        if self.error == errors.RATELIMIT:
+            period_end = datetime.utcfromtimestamp(
+                rate_limit.timeslice.end).replace(tzinfo=pytz.UTC)
+            time = utils.timeuntil(period_end)
+            self.set_error(errors.RATELIMIT, {'time': time},
+                            field='ratelimit', code=429)
+        else:
+            self.set_error(self.error)
 
     @classmethod
-    def ratelimit(cls, prefix, rate_user=False, rate_ip=False):
+    def ratelimit(cls, user_limit=None, ip_limit=None):
         """Record usage of a resource."""
-        time_slice = ratelimit.get_timeslice(g.RL_RESET_SECONDS)
+        if user_limit and c.user_is_loggedin:
+            user_limit.record_usage()
 
-        if rate_user and c.user_is_loggedin:
-            ratelimit_key = '%s-user-%s' % (cls.KEY_PREFIX, c.user._id36)
-            ratelimit.record_usage(ratelimit_key, time_slice)
-            cls._record_event(prefix, 'set_user_limit')
-        if rate_ip:
-            ratelimit_key = '%s-ip-%s' % (cls.KEY_PREFIX, request.ip)
-            ratelimit.record_usage(ratelimit_key, time_slice)
-            cls._record_event(prefix, 'set_ip_limit')
+        if ip_limit:
+            ip_limit.record_usage()
+
+
+class VShareRatelimit(VRatelimitImproved):
+    USER_LIMIT = VRatelimitImproved.RateLimit(
+        'share', 'user',
+        limit=g.RL_SHARE_MAX_REQS,
+        seconds=g.RL_RESET_SECONDS,
+        event_id_fn=lambda: c.user._id36)
+
+    IP_LIMIT = VRatelimitImproved.RateLimit(
+        'share', 'ip',
+        limit=g.RL_SHARE_MAX_REQS,
+        seconds=g.RL_RESET_SECONDS,
+        event_id_fn=lambda: request.ip)
+
+    def __init__(self):
+        super(VShareRatelimit, self).__init__(
+            user_limit=self.USER_LIMIT, ip_limit=self.IP_LIMIT)
 
     @classmethod
-    def _record_event(cls, prefix, event):
-        g.stats.event_count('VRatelimitImproved.%s' % prefix, event, sample_rate=0.1)
+    def ratelimit(cls):
+        super(VShareRatelimit, cls).ratelimit(
+            user_limit=cls.USER_LIMIT, ip_limit=cls.IP_LIMIT)
 
 
 class VCommentIDs(Validator):
@@ -2238,16 +2281,6 @@ class VCommentIDs(Validator):
             self.param: "a comma-delimited list of comment ID36s",
         }
 
-
-class CachedUser(object):
-    def __init__(self, cache_prefix, user, key):
-        self.cache_prefix = cache_prefix
-        self.user = user
-        self.key = key
-
-    def clear(self):
-        if self.key and self.cache_prefix:
-            g.cache.delete(str(self.cache_prefix + "_" + self.key))
 
 class VOneTimeToken(Validator):
     def __init__(self, model, param, *args, **kwargs):
@@ -2788,14 +2821,14 @@ class VOneTimePassword(Validator):
     def validate_otp(cls, secret, password):
         # is the password a valid format and has it been used?
         try:
-            key = "otp-%s-%d" % (c.user._id36, int(password))
+            key = "otp:used_%s_%d" % (c.user._id36, int(password))
         except (TypeError, ValueError):
             valid_and_unused = False
         else:
             # leave this key around for one more time period than the maximum
             # number of time periods we'll check for valid passwords
             key_ttl = totp.PERIOD * (len(cls.allowed_skew) + 1)
-            valid_and_unused = g.cache.add(key, True, time=key_ttl)
+            valid_and_unused = g.gencache.add(key, True, time=key_ttl)
 
         # check the password (allowing for some clock-skew as 2FA-users
         # frequently travel at relativistic velocities)
@@ -2822,10 +2855,12 @@ class VOneTimePassword(Validator):
         # make sure they're not trying this too much
         if not g.disable_ratelimit:
             current_password = totp.make_totp(secret)
-            key = "otp-tries-" + current_password
-            g.cache.add(key, 0)
-            recent_attempts = g.cache.incr(key)
-            if recent_attempts > self.ratelimit:
+            otp_ratelimit = ratelimit.SimpleRateLimit(
+                name="otp_tries_%s_%s" % (c.user._id36, current_password),
+                seconds=600,
+                limit=self.ratelimit,
+            )
+            if not otp_ratelimit.record_and_check():
                 self.set_error(errors.RATELIMIT, dict(time="30 seconds"))
                 return
 
@@ -3215,3 +3250,41 @@ class VResultTypes(Validator):
                 '(`%s`)' % '`, `'.join(self.options)
             ),
         }
+
+
+class VSigned(Validator):
+    """Validate if the request is properly signed.
+
+    Checks the headers (mostly the User-Agent) are signed with
+    :py:function:`~r2.lib.signing.valid_ua_signature` and in the case
+    of POST and PUT ensure that any request.body included is also signed
+    via :py:function:`~r2.lib.signing.valid_body_signature`.
+
+    In :py:method:`run`, the signatures are combined as needed to generate a
+    final signature that is generally the combination of the two.
+    """
+
+    def run(self):
+        signature = signing.valid_ua_signature(request)
+
+        # only check the request body when there should be one
+        if request.method.upper() in ("POST", "PUT"):
+            signature.update(signing.valid_post_signature(request))
+
+        # add a simple event for each error as it appears (independent of
+        # whether we're going to ignore them).
+        for code, field in signature.errors:
+            g.stats.simple_event(
+                "signing.%s.invalid.%s" % (field, code.lower())
+            )
+
+        # persistent skew problems on android suggest something deeper is
+        # wrong in v1.  Disable the expiration check for now!
+        if signature.platform == "android" and signature.version == 1:
+            signature.add_ignore(signing.ERRORS.EXPIRED_TOKEN)
+
+        return signature
+
+
+def need_provider_captcha():
+    return False

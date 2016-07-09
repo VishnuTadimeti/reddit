@@ -80,7 +80,7 @@ def load_controllers():
     from oembed import OEmbedController
     from policies import PoliciesController
     from web import WebLogController
-    
+
     from wiki import WikiController
     from wiki import WikiApiController
 
@@ -88,6 +88,7 @@ def load_controllers():
     from api import ApiminimalController
     from api_docs import ApidocsController
     from apiv1.user import APIv1UserController
+    from apiv1.login import APIv1LoginController
     from apiv1.gold import APIv1GoldController
     from apiv1.scopes import APIv1ScopesController
     from multi import MultiApiController
@@ -95,7 +96,6 @@ def load_controllers():
     from oauth2 import OAuth2AccessController
     from redirect import RedirectController
     from robots import RobotsController
-    from sitemap import SitemapController
     from ipn import IpnController
     from ipn import StripeController
     from ipn import CoinbaseController

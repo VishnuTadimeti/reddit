@@ -32,8 +32,6 @@ from r2.controllers.reddit_base import (
     generate_modhash,
     is_trusted_origin,
     MinimalController,
-    pagecache_policy,
-    PAGECACHE_POLICY,
     paginated_listing,
     RedditController,
     set_user_cookie,
@@ -51,6 +49,7 @@ from r2.models import *
 from r2.lib import amqp
 from r2.lib import recommender
 from r2.lib import hooks
+from r2.lib.ratelimit import SimpleRateLimit
 
 from r2.lib.utils import (
     blockquote_text,
@@ -114,8 +113,16 @@ from r2.lib.filters import safemarkdown
 from r2.lib.media import str_to_image
 from r2.controllers.api_docs import api_doc, api_section
 from r2.controllers.oauth2 import require_oauth2_scope, allow_oauth2_access
-from r2.lib.template_helpers import add_sr, get_domain, make_url_protocol_relative
-from r2.lib.system_messages import notify_user_added, send_ban_message
+from r2.lib.template_helpers import (
+    add_sr,
+    get_domain,
+    make_url_protocol_relative,
+)
+from r2.lib.system_messages import (
+    notify_user_added,
+    send_ban_message,
+    send_mod_removal_message,
+)
 from r2.controllers.ipn import generate_blob, update_blob
 from r2.controllers.login import handle_login, handle_register
 from r2.lib.lock import TimeoutExpired
@@ -170,7 +177,6 @@ class ApiController(RedditController):
     def ajax_login_redirect(self, form, jquery, dest):
         form.redirect("/login" + query_string(dict(dest=dest)))
 
-    @pagecache_policy(PAGECACHE_POLICY.NEVER)
     @require_oauth2_scope("read")
     @validate(
         things=VByName('id', multiple=True, ignore_missing=True, limit=100),
@@ -196,7 +202,6 @@ class ApiController(RedditController):
         listing = wrap_links(things)
         return BoringPage(_("API"), content=listing).render()
 
-    @pagecache_policy(PAGECACHE_POLICY.NEVER)
     @require_oauth2_scope("read")
     @validate(
         url=VUrl('url'),
@@ -816,20 +821,32 @@ class ApiController(RedditController):
                 if type == 'muted':
                     required_perms.append('mail')
 
-        if (not c.user_is_admin
-            and (type in self._sr_friend_types
-                 and not container.is_moderator_with_perms(
-                     c.user, *required_perms))):
+        if (
+            not c.user_is_admin and
+            type in self._sr_friend_types and
+            not container.is_moderator_with_perms(c.user, *required_perms)
+        ):
             abort(403, 'forbidden')
-        if (type == 'moderator' and not
-            (c.user_is_admin or container.can_demod(c.user, victim))):
+        if (
+            type == "moderator" and
+            not c.user_is_admin and
+            not container.can_demod(c.user, victim)
+        ):
             abort(403, 'forbidden')
+
         # if we are (strictly) unfriending, the container had better
         # be the current user.
         if type in ("friend", "enemy") and container != c.user:
             abort(403, 'forbidden')
+
         fn = getattr(container, 'remove_' + type)
         new = fn(victim)
+
+        # for mod removals, let the now ex-mod know (NOTE: doing this earlier
+        # will make the message show up in their mod inbox, which they will
+        # immediately lose access to.)
+        if new and type == 'moderator' and victim != c.user:
+            send_mod_removal_message(container, c.user, victim)
 
         # Log this action
         if new and type in self._sr_friend_types:
@@ -979,12 +996,15 @@ class ApiController(RedditController):
                 form.set_error(errors.SUBREDDIT_RATELIMIT, "name")
                 return
 
-        if type in self._sr_friend_types and not c.user_is_admin:
-            quota_key = "sr%squota-%s" % (str(type), container._id36)
-            g.cache.add(quota_key, 0, time=g.sr_quota_time)
-            subreddit_quota = g.cache.incr(quota_key)
-            quota_limit = getattr(g, "sr_%s_quota" % type)
-            if subreddit_quota > quota_limit and container.use_quotas:
+        if (type in self._sr_friend_types and
+                not c.user_is_admin and
+                container.use_quotas):
+            sr_ratelimit = SimpleRateLimit(
+                name="sr_%s_%s" % (str(type), container._id36),
+                seconds=g.sr_quota_time,
+                limit=getattr(g, "sr_%s_quota" % type),
+            )
+            if not sr_ratelimit.record_and_check():
                 form.set_text(".status", errors.SUBREDDIT_RATELIMIT)
                 c.errors.add(errors.SUBREDDIT_RATELIMIT)
                 form.set_error(errors.SUBREDDIT_RATELIMIT, None)
@@ -1380,6 +1400,9 @@ class ApiController(RedditController):
         if isinstance(thing, Link):
             queries.delete(thing)
             thing.subreddit_slow.remove_sticky(thing)
+            if thing.preview_object:
+                thing.set_preview_object(None)
+                thing._commit()
         elif isinstance(thing, Comment):
             link = thing.link_slow
 
@@ -1619,6 +1642,9 @@ class ApiController(RedditController):
             abort(400, "Can't sticky a removed or deleted post")
 
         if state:
+            if not thing.is_stickyable():
+                abort(400, "Post not stickyable")
+
             if stickied:
                 abort(409, "Already stickied")
             sr.set_sticky(thing, c.user, num=num)
@@ -1851,12 +1877,14 @@ class ApiController(RedditController):
             if not subreddit.is_moderator_with_perms(c.user, 'access', 'mail'):
                 abort(403, 'Invalid mod permissions')
 
-            quota_key = "sr%squota-%s" % ("muted", subreddit._id36)
-            g.cache.add(quota_key, 0, time=g.sr_quota_time)
-            subreddit_quota = g.cache.incr(quota_key)
-            quota_limit = getattr(g, "sr_%s_quota" % "muted")
-            if subreddit_quota > quota_limit and subreddit.use_quotas:
-                abort(403, errors.SUBREDDIT_RATELIMIT)
+            if subreddit.use_quotas:
+                sr_ratelimit = SimpleRateLimit(
+                    name="sr_muted_%s" % subreddit._id36,
+                    seconds=g.sr_quota_time,
+                    limit=g.sr_muted_quota,
+                )
+                if not sr_ratelimit.record_and_check():
+                    abort(403, errors.SUBREDDIT_RATELIMIT)
 
         # Don't allow a user in timeout to mute users
         VNotInTimeout().run(action_name="muteuser", details_text="modmail",
@@ -2144,10 +2172,9 @@ class ApiController(RedditController):
     @validatedForm(
         VUser(),
         VModhash(),
-        VRatelimitImproved(prefix='share', max_usage=g.RL_SHARE_MAX_REQS,
-                           rate_user=True, rate_ip=True),
+        VShareRatelimit(),
         share_to=ValidEmailsOrExistingUnames("share_to"),
-        message=VLength("message", max_length=1000), 
+        message=VLength("message", max_length=1000),
         link=VByName('parent', thing_cls=Link),
     )
     def POST_share(self, shareform, jquery, share_to, message, link):
@@ -2243,7 +2270,7 @@ class ApiController(RedditController):
         g.stats.simple_event('share.pm_sent', len(users))
 
         # Set the ratelimiter.
-        VRatelimitImproved.ratelimit('share', rate_user=True, rate_ip=True)
+        VShareRatelimit.ratelimit()
 
     @require_oauth2_scope("vote")
     @noresponse(VUser(),
@@ -2321,11 +2348,21 @@ class ApiController(RedditController):
         `op` should be `save` to update the contents of the stylesheet.
 
         """
-        
-        css_errors, parsed = c.site.parse_css(stylesheet_contents)
 
         if g.css_killswitch:
             return abort(403, 'forbidden')
+
+        css_errors, parsed = c.site.parse_css(stylesheet_contents)
+
+        # The hook passes errors back by setting them on the form.
+        hooks.get_hook('subreddit.css.validate').call(
+            request=request, form=form, op=op,
+            stylesheet_contents=stylesheet_contents,
+            parsed_stylesheet=parsed,
+            css_errors=css_errors,
+            subreddit=c.site,
+            user=c.user
+        )
 
         if css_errors:
             error_items = [CssError(x).render(style='html') for x in css_errors]
@@ -2343,7 +2380,7 @@ class ApiController(RedditController):
         VNotInTimeout().run(action_name="editsettings",
             details_text="%s_stylesheet" % op, target=c.site)
 
-        if op == 'save':
+        if op == 'save' and not form.has_error():
             wr = c.site.change_css(stylesheet_contents, parsed, reason=reason)
             form.find('.errors').hide()
             form.set_text(".status", _('saved'))
@@ -3612,7 +3649,6 @@ class ApiController(RedditController):
 
                 admintools.adjust_gold_expiration(c.user, days=days)
 
-                g.cache.set("recent-gold-" + c.user.name, True, 600)
                 status = 'claimed-gold'
                 jquery(".lounge").show()
 
@@ -4601,7 +4637,7 @@ class ApiController(RedditController):
             return
 
         secret = totp.generate_secret()
-        g.cache.set('otp_secret_' + c.user._id36, secret, time=300)
+        g.gencache.set("otp:secret_" + c.user._id36, secret, time=300)
         jquery("body").make_totp_qrcode(secret)
 
     @validatedForm(VUser(),
@@ -4616,7 +4652,7 @@ class ApiController(RedditController):
             form.has_errors("otp", errors.OTP_ALREADY_ENABLED)
             return
 
-        secret = g.cache.get("otp_secret_" + c.user._id36)
+        secret = g.gencache.get("otp:secret_" + c.user._id36)
         if not secret:
             c.errors.add(errors.EXPIRED, field="otp")
             form.has_errors("otp", errors.EXPIRED)

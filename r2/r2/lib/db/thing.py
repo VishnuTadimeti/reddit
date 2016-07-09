@@ -32,16 +32,15 @@ from _pylibmc import MemcachedError
 from pylons import app_globals as g
 
 from r2.lib import amqp, hooks
-from r2.lib.cache import sgm
 from r2.lib.db import tdb_sql as tdb, sorts, operators
+from r2.lib.sgm import sgm
 from r2.lib.utils import class_property, Results, tup, to36
 
 
-THING_CACHE_TTL = int(timedelta(days=1).total_seconds())
-QUERY_CACHE_TTL = int(timedelta(days=1).total_seconds())
+class NotFound(Exception):
+    pass
 
 
-class NotFound(Exception): pass
 CreationError = tdb.CreationError
 
 thing_types = {}
@@ -81,6 +80,7 @@ class DataThing(object):
     c = operators.Slots()
     __safe__ = False
     _cache = g.cache
+    _cache_ttl = int(timedelta(hours=12).total_seconds())
 
     def __init__(self):
         safe_set_attr = SafeSetAttr(self)
@@ -186,7 +186,7 @@ class DataThing(object):
         cache = cls._cache
         prefix = cls._cache_prefix()
         try:
-            cache.add_multi(things_by_id, prefix=prefix, time=THING_CACHE_TTL)
+            cache.add_multi(things_by_id, prefix=prefix, time=cls._cache_ttl)
         except MemcachedError as e:
             g.log.warning("write_things_to_cache error: %s", e)
 
@@ -236,7 +236,7 @@ class DataThing(object):
 
         cache = self.__class__._cache
         key = self._cache_key()
-        cache.set(key, self, time=THING_CACHE_TTL)
+        cache.set(key, self, time=self.__class__._cache_ttl)
 
     def update_from_cache(self, lock):
         """Read the current value of thing from cache and update self.
@@ -649,33 +649,37 @@ class Thing(DataThing):
 
             self.__setattr__(prop, new_val, make_dirty=False)
 
-            if is_base_prop:
-                # can just incr a base prop because it must have been set when
-                # the object was created
-                tdb.incr_thing_prop(
-                    type_id=self.__class__._type_id,
-                    thing_id=self._id,
-                    prop=db_prop,
-                    amount=amt,
-                )
-            elif (prop in self.__class__._defaults and
-                    self.__class__._defaults[prop] == old_val):
-                # when updating a data prop from the default value assume the
-                # value was never actually set so it's not safe to incr
-                tdb.set_thing_data(
-                    type_id=self.__class__._type_id,
-                    thing_id=self._id,
-                    brand_new_thing=False,
-                    **{db_prop: new_val}
-                )
-            else:
-                tdb.incr_thing_data(
-                    type_id=self.__class__._type_id,
-                    thing_id=self._id,
-                    prop=db_prop,
-                    amount=amt,
-                )
-            self.write_thing_to_cache(lock)
+            with TdbTransactionContext():
+                if is_base_prop:
+                    # can just incr a base prop because it must have been set
+                    # when the object was created
+                    tdb.incr_thing_prop(
+                        type_id=self.__class__._type_id,
+                        thing_id=self._id,
+                        prop=db_prop,
+                        amount=amt,
+                    )
+                elif (prop in self.__class__._defaults and
+                        self.__class__._defaults[prop] == old_val):
+                    # when updating a data prop from the default value assume
+                    # the value was never actually set so it's not safe to incr
+                    tdb.set_thing_data(
+                        type_id=self.__class__._type_id,
+                        thing_id=self._id,
+                        brand_new_thing=False,
+                        **{db_prop: new_val}
+                    )
+                else:
+                    tdb.incr_thing_data(
+                        type_id=self.__class__._type_id,
+                        thing_id=self._id,
+                        prop=db_prop,
+                        amount=amt,
+                    )
+
+                # write to cache within the transaction context so an exception
+                # will cause a transaction rollback
+                self.write_thing_to_cache(lock)
         self.record_cache_write(event="incr")
 
     @property
@@ -1067,20 +1071,18 @@ def Relation(type1, type2):
             """Return only the requested props rather than Relation objects."""
             return RelationsPropsOnly(cls, props, *rules, **kw)
 
-
     return RelationCls
 Relation._type_prefix = 'r'
 
-class Query(object):
-    _cache = g.cache
 
+class Query(object):
     def __init__(self, kind, *rules, **kw):
         self._rules = []
         self._kind = kind
 
         self._read_cache = kw.get('read_cache')
         self._write_cache = kw.get('write_cache')
-        self._cache_time = kw.get('cache_time', QUERY_CACHE_TTL)
+        self._cache_time = kw.get('cache_time', 86400)
         self._limit = kw.get('limit')
         self._offset = kw.get('offset')
         self._stale = kw.get('stale', False)
@@ -1088,7 +1090,7 @@ class Query(object):
         self._filter_primary_sort_only = kw.get('filter_primary_sort_only', False)
 
         self._filter(*rules)
-    
+
     def _setsort(self, sorts):
         sorts = tup(sorts)
         #make sure sorts are wrapped in a Sort obj
@@ -1167,29 +1169,27 @@ class Query(object):
     def _cursor(*a, **kw):
         raise NotImplementedError
 
-    def _get_iden_str(self):
-        i = str(self._sort) + str(self._kind) + str(self._limit)
-
-        if self._offset:
-            i += str(self._offset)
-
+    def _cache_key(self):
+        fingerprint = str(self._sort) + str(self._limit) + str(self._offset)
         if self._rules:
             rules = copy(self._rules)
             rules.sort()
-            for r in rules:
-                i += str(r)
-        return i
+            for rule in rules:
+                fingerprint += str(rule)
 
-    def _iden(self):
-        i = self._get_iden_str()
-        return hashlib.sha1(i).hexdigest()
+        cache_key = "query:{kind}.{id}".format(
+            kind=self._kind.__name__,
+            id=hashlib.sha1(fingerprint).hexdigest()
+        )
+        return cache_key
 
     def _get_results(self):
         things = self._cursor().fetchall()
         return things
 
     def get_from_cache(self, allow_local=True):
-        thing_fullnames = self._cache.get(self._iden(), allow_local=allow_local)
+        thing_fullnames = g.gencache.get(
+            self._cache_key(), allow_local=allow_local)
         if thing_fullnames:
             things = Thing._by_fullname(thing_fullnames, return_dict=False,
                                         stale=self._stale)
@@ -1197,7 +1197,7 @@ class Query(object):
 
     def set_to_cache(self, things):
         thing_fullnames = [thing._fullname for thing in things]
-        self._cache.set(self._iden(), thing_fullnames, self._cache_time)
+        g.gencache.set(self._cache_key(), thing_fullnames, self._cache_time)
 
     def __iter__(self):
         if self._read_cache:
@@ -1211,7 +1211,7 @@ class Query(object):
             # it's not in the cache, and we have the power to
             # update it, which we should do in a lock to prevent
             # concurrent requests for the same data
-            with g.make_lock("thing_query", "lock_%s" % self._iden()):
+            with g.make_lock("thing_query", "lock_%s" % self._cache_key()):
                 # see if it was set while we were waiting for our
                 # lock
                 if self._read_cache:
@@ -1328,20 +1328,30 @@ class RelationsPropsOnly(Relations):
         )
         return c
 
-    def _get_iden_str(self):
-        i = Relations._get_iden_str(self)
-        i += '|'.join(sorted(self.props))
-        return i
+    def _cache_key(self):
+        fingerprint = str(self._sort) + str(self._limit) + str(self._offset)
+        if self._rules:
+            rules = copy(self._rules)
+            rules.sort()
+            for rule in rules:
+                fingerprint += str(rule)
+        fingerprint += '|'.join(sorted(self.props))
+
+        cache_key = "query:{kind}.{id}".format(
+            kind=self._kind.__name__,
+            id=hashlib.sha1(fingerprint).hexdigest()
+        )
+        return cache_key
 
     def _get_results(self):
         rows = self._cursor().fetchall()
         return rows
 
     def get_from_cache(self, allow_local=True):
-        return self._cache.get(self._iden(), allow_local=allow_local)
+        return g.gencache.get(self._cache_key(), allow_local=allow_local)
 
     def set_to_cache(self, rows):
-        self._cache.set(self._iden(), rows, self._cache_time)
+        g.gencache.set(self._cache_key(), rows, self._cache_time)
 
 
 class MultiCursor(object):
@@ -1417,13 +1427,20 @@ class MergeCursor(MultiCursor):
             pairs = undone(pairs)
         raise StopIteration
 
+
 class MultiQuery(Query):
     def __init__(self, queries, *rules, **kw):
         self._queries = queries
         Query.__init__(self, None, *rules, **kw)
 
-    def _iden(self):
-        return ''.join(q._iden() for q in self._queries)
+        assert not self._read_cache
+        assert not self._write_cache
+
+    def get_from_cache(self):
+        raise NotImplementedError()
+
+    def set_to_cache(self):
+        raise NotImplementedError()
 
     def _cursor(self):
         raise NotImplementedError()
@@ -1471,6 +1488,7 @@ class MultiQuery(Query):
             q._limit = limit
 
     _limit = property(_getlimit, _setlimit)
+
 
 class Merge(MultiQuery):
     def _cursor(self):

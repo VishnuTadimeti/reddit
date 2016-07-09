@@ -226,6 +226,12 @@ class NonCache(object):
     def set_multi(self, *a, **kw):
         return
 
+    def add(self, *a, **kw):
+        return
+
+    def incr(self, *a, **kw):
+        return
+
 
 class RedditControllerTestCase(RedditTestCase):
     CONTROLLER = None
@@ -252,8 +258,9 @@ class RedditControllerTestCase(RedditTestCase):
         self.patch_g(
             rendercache=NonCache(),
             ratelimitcache=NonCache(),
-            pagecache=NonCache(),
+            commentpanecache=NonCache(),
             cache=NonCache(),
+            gencache=NonCache(),
         )
 
         self.mock_eventcollector()

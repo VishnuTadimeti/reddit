@@ -480,6 +480,11 @@ class Link(Thing, Printable):
 
         return res
 
+    def make_canonical_link(self, sr, subdomain='www'):
+        domain = '%s.%s' % (subdomain, g.domain)
+        path = 'comments/%s/%s/' % (self._id36, title_to_url(self.title))
+        return '%s://%s/r/%s/%s' % (g.default_scheme, domain, sr.name, path)
+
     def make_permalink_slow(self, force_domain=False):
         return self.make_permalink(self.subreddit_slow,
                                    force_domain=force_domain)
@@ -1108,6 +1113,12 @@ class Link(Thing, Printable):
 
     def set_preview_object(self, value):
         self.preview_object = Link._utf8_encode(value)
+
+    def is_stickyable(self):
+        if self._deleted or self._spam:
+            return False
+
+        return True
 
 
 class LinksByUrlAndSubreddit(tdb_cassandra.View):
@@ -1992,6 +2003,7 @@ class MoreChildren(MoreComments):
 
 
 class Message(Thing, Printable):
+    _cache = g.thingcache
     _defaults = dict(reported=0,
                      was_comment=False,
                      parent_id=None,
@@ -2011,6 +2023,10 @@ class Message(Thing, Printable):
     _data_int_props = Thing._data_int_props + ('reported',)
     _essentials = ('author_id',)
     cache_ignore = set(["to", "subreddit"]).union(Printable.cache_ignore)
+
+    @classmethod
+    def _cache_prefix(cls):
+        return "message:"
 
     @classmethod
     def _new(cls, author, to, subject, body, ip, parent=None, sr=None,
@@ -2809,17 +2825,23 @@ class LinksByImage(tdb_cassandra.View):
         return columns.iterkeys()
 
 
-_AccountCommentInbox = Relation(Account, Comment)
-_AccountMessageInbox = Relation(Account, Message)
+_CommentInbox = Relation(Account, Comment)
+_CommentInbox._defaults = {
+    "new": False,
+}
+_CommentInbox._cache = g.thingcache
+_CommentInbox._cache_prefix = classmethod(lambda cls: "inboxcomment:")
 
 
-for rel_cls in (_AccountCommentInbox, _AccountMessageInbox):
-    rel_cls._defaults = {
-        "new": False,
-    }
+_MessageInbox = Relation(Account, Message)
+_MessageInbox._defaults = {
+    "new": False,
+}
+_MessageInbox._cache = g.thingcache
+_MessageInbox._cache_prefix = classmethod(lambda cls: "inboxmessage:")
 
 
-class Inbox(MultiRelation('inbox', _AccountCommentInbox, _AccountMessageInbox)):
+class Inbox(MultiRelation('inbox', _CommentInbox, _MessageInbox)):
     @classmethod
     def _add(cls, to, obj, *a, **kw):
         orangered = kw.pop("orangered", True)
@@ -2920,7 +2942,12 @@ class Inbox(MultiRelation('inbox', _AccountCommentInbox, _AccountMessageInbox)):
 
 
 class ModeratorInbox(Relation(Subreddit, Message)):
-    #TODO: shouldn't dupe this
+    _cache = g.thingcache
+
+    @classmethod
+    def _cache_prefix(cls):
+        return "modinbox:"
+
     @classmethod
     def _add(cls, sr, obj, *a, **kw):
         i = ModeratorInbox(sr, obj, *a, **kw)
@@ -2940,6 +2967,7 @@ class ModeratorInbox(Relation(Subreddit, Message)):
                 i._commit()
             res.append(i)
         return res
+
 
 class CommentsByAccount(tdb_cassandra.DenormalizedRelation):
     _use_db = True

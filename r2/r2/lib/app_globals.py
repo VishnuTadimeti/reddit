@@ -82,6 +82,7 @@ from r2.lib.stats import (
 )
 from r2.lib.translation import get_active_langs, I18N_PATH
 from r2.lib.utils import config_gold_price, thread_dump
+from r2.lib.zookeeper import connect_to_zookeeper, LiveConfig, LiveList
 
 
 LIVE_CONFIG_NODE = "/config/live"
@@ -171,7 +172,6 @@ class Globals(object):
         ConfigValue.int: [
             'db_pool_size',
             'db_pool_overflow_size',
-            'page_cache_time',
             'commentpane_cache_time',
             'num_mc_clients',
             'MAX_CAMPAIGNS_PER_LINK',
@@ -197,6 +197,7 @@ class Globals(object):
             'bcrypt_work_factor',
             'cassandra_pool_size',
             'sr_banned_quota',
+            'sr_muted_quota',
             'sr_wikibanned_quota',
             'sr_wikicontributor_quota',
             'sr_moderator_invite_quota',
@@ -324,6 +325,11 @@ class Globals(object):
              'cassandra_wcl',
         ],
 
+        ConfigValue.choice(zookeeper="zookeeper", config="config"): [
+            "liveconfig_source",
+            "secrets_source",
+        ],
+
         ConfigValue.timeinterval: [
             'ARCHIVE_AGE',
             "vote_queue_grace_period",
@@ -340,6 +346,10 @@ class Globals(object):
 
         ConfigValue.baseplate(baseplate_config.Optional(baseplate_config.Endpoint)): [
             "activity_endpoint",
+        ],
+
+        ConfigValue.dict(ConfigValue.str, ConfigValue.str): [
+            'emr_traffic_tags',
         ],
     }
 
@@ -388,6 +398,7 @@ class Globals(object):
             'mweb_blacklist_expressions',
             'global_loid_experiments',
             'precomputed_comment_sorts',
+            'mailgun_domains',
         ],
         ConfigValue.str: [
             'listing_chooser_gold_multi',
@@ -673,33 +684,29 @@ class Globals(object):
         self.startup_timer.intermediate("configuration")
 
         ################# ZOOKEEPER
-        # for now, zookeeper will be an optional part of the stack.
-        # if it's not configured, we will grab the expected config from the
-        # [live_config] section of the ini file
-        zk_hosts = self.config.get("zookeeper_connection_string")
-        if zk_hosts:
-            from r2.lib.zookeeper import (connect_to_zookeeper,
-                                          LiveConfig, LiveList)
-            zk_username = self.config["zookeeper_username"]
-            zk_password = self.config["zookeeper_password"]
-            self.zookeeper = connect_to_zookeeper(zk_hosts, (zk_username,
-                                                             zk_password))
-            self.live_config = LiveConfig(self.zookeeper, LIVE_CONFIG_NODE)
-            self.secrets = fetch_secrets(self.zookeeper)
-            self.throttles = LiveList(self.zookeeper, "/throttles",
-                                      map_fn=ipaddress.ip_network,
-                                      reduce_fn=ipaddress.collapse_addresses)
+        zk_hosts = self.config["zookeeper_connection_string"]
+        zk_username = self.config["zookeeper_username"]
+        zk_password = self.config["zookeeper_password"]
+        self.zookeeper = connect_to_zookeeper(zk_hosts, (zk_username,
+                                                         zk_password))
 
-            # close our zk connection when the app shuts down
-            SHUTDOWN_CALLBACKS.append(self.zookeeper.stop)
+        self.throttles = LiveList(self.zookeeper, "/throttles",
+                                  map_fn=ipaddress.ip_network,
+                                  reduce_fn=ipaddress.collapse_addresses)
+
+        parser = ConfigParser.RawConfigParser()
+        parser.optionxform = str
+        parser.read([self.config["__file__"]])
+
+        if self.config["liveconfig_source"] == "zookeeper":
+            self.live_config = LiveConfig(self.zookeeper, LIVE_CONFIG_NODE)
         else:
-            self.zookeeper = None
-            parser = ConfigParser.RawConfigParser()
-            parser.optionxform = str
-            parser.read([self.config["__file__"]])
             self.live_config = extract_live_config(parser, self.plugins)
+
+        if self.config["secrets_source"] == "zookeeper":
+            self.secrets = fetch_secrets(self.zookeeper)
+        else:
             self.secrets = extract_secrets(parser)
-            self.throttles = tuple()  # immutable since it's not real
 
         ################# PRIVILEGED USERS
         self.admins = PermissionFilteredEmployeeList(
@@ -868,9 +875,18 @@ class Globals(object):
                 stalecaches,
                 memcaches,
             )
+            # temporary duplicate for g.cache as we move keys in that pool
+            # to mcrouter
+            self.gencache = StaleCacheChain(
+                localcache_cls(),
+                stalecaches,
+                self.mcrouter,
+            )
         else:
             self.cache = CacheChain((localcache_cls(), memcaches))
+            self.gencache = CacheChain((localcache_cls(), self.mcrouter))
         cache_chains.update(cache=self.cache)
+        cache_chains.update(gencache=self.gencache)
 
         if stalecaches:
             self.thingcache = StaleCacheChain(
@@ -926,12 +942,12 @@ class Globals(object):
         ))
         cache_chains.update(rendercache=self.rendercache)
 
-        # pagecaches hold fully rendered pages (includes comment panes)
-        self.pagecache = MemcacheChain((
+        # commentpanecaches hold fully rendered comment panes
+        self.commentpanecache = MemcacheChain((
             localcache_cls(),
             self.mcrouter,
         ))
-        cache_chains.update(pagecache=self.pagecache)
+        cache_chains.update(commentpanecache=self.commentpanecache)
 
         # cassandra_local_cache is used for request-local caching in tdb_cassandra
         self.cassandra_local_cache = localcache_cls()

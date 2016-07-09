@@ -61,9 +61,6 @@ def make_map(config):
     mc('/robots.txt', controller='robots', action='robots')
     mc('/crossdomain', controller='robots', action='crossdomain')
 
-    mc('/sitemap', controller='sitemap', action='index')
-    mc('/subreddit_sitemap', controller='sitemap', action='subreddits')
-
     mc('/login', controller='forms', action='login')
     mc('/register', controller='forms', action='register')
     mc('/logout', controller='forms', action='logout')
@@ -102,7 +99,8 @@ def make_map(config):
     mc('/subreddits/login', controller='forms', action='login')
     mc('/subreddits/:where', controller='reddits', action='listing',
        where='popular', conditions={'function':not_in_sr},
-       requirements=dict(where="popular|new|banned|employee|gold|default|quarantine"))
+       requirements=dict(where="popular|new|banned|employee|gold|default|"
+                               "quarantine|featured"))
     # If no subreddit is specified, might as well show a list of 'em.
     mc('/r', controller='redirect', action='redirect', dest='/subreddits')
 
@@ -444,6 +442,8 @@ def make_map(config):
        requirements=dict(action="scopes"))
     mc("/api/v1/user/:username/trophies",
        controller="apiv1user", action="usertrophies")
+    mc("/api/v1/:action", controller="apiv1login",
+       requirements=dict(action="register|login"))
     mc("/api/v1/:action", controller="apiv1user")
     # Same controller/action as /prefs/friends
     mc("/api/v1/me/:where", controller="userlistlisting",

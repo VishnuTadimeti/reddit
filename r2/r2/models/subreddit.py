@@ -64,7 +64,8 @@ from r2.lib.utils import (
     tup,
     unicode_title_to_ascii,
 )
-from r2.lib.cache import sgm
+from r2.lib.cache import MemcachedError
+from r2.lib.sgm import sgm
 from r2.lib.strings import strings, Score
 from r2.lib.filters import _force_unicode
 from r2.lib.db import tdb_cassandra
@@ -446,8 +447,8 @@ class Subreddit(Thing, Printable, BaseSite):
 
         if to_fetch:
             if not _update:
-                srids_by_name = g.cache.get_multi(
-                    to_fetch.keys(), prefix='subreddit.byname', stale=True)
+                srids_by_name = g.gencache.get_multi(
+                    to_fetch.keys(), prefix='srid:', stale=True)
             else:
                 srids_by_name = {}
 
@@ -470,8 +471,10 @@ class Subreddit(Thing, Printable, BaseSite):
 
                     still_missing = set(srnames) - set(fetched)
                     fetched.update((name, cls.SRNAME_NOTFOUND) for name in still_missing)
-
-                    g.cache.set_multi(fetched, prefix='subreddit.byname')
+                    try:
+                        g.gencache.add_multi(fetched, prefix='srid:')
+                    except MemcachedError:
+                        pass
 
             srs = {}
             srids = [v for v in srids_by_name.itervalues() if v != cls.SRNAME_NOTFOUND]
@@ -1055,6 +1058,17 @@ class Subreddit(Thing, Printable, BaseSite):
             return [sr._id for sr in srs]
         else:
             return srs
+
+    @classmethod
+    def featured_subreddits(cls):
+        """Return the curated list of subreddits shown during onboarding."""
+        location = get_user_location()
+        srids = LocalizedFeaturedSubreddits.get_featured(location)
+
+        srs = Subreddit._byID(srids, data=True, return_dict=False, stale=True)
+        srs = filter(lambda sr: sr.discoverable, srs)
+
+        return srs
 
     @classmethod
     @memoize('random_reddits', time = 1800)
@@ -1971,9 +1985,9 @@ class TooManySubredditsError(Exception):
     pass
 
 
-class LocalizedDefaultSubreddits(tdb_cassandra.View):
+class BaseLocalizedSubreddits(tdb_cassandra.View):
     """Mapping of location to subreddit ids"""
-    _use_db = True
+    _use_db = False
     _compare_with = tdb_cassandra.ASCII_TYPE
     _read_consistency_level = tdb_cassandra.CL.QUORUM
     _write_consistency_level = tdb_cassandra.CL.QUORUM
@@ -1982,7 +1996,6 @@ class LocalizedDefaultSubreddits(tdb_cassandra.View):
         "default_validation_class": tdb_cassandra.ASCII_TYPE,
     }
     GLOBAL = "GLOBAL"
-    CACHE_PREFIX = "localized_defaults"
 
     @classmethod
     def _rowkey(cls, location):
@@ -2000,8 +2013,13 @@ class LocalizedDefaultSubreddits(tdb_cassandra.View):
             return ret
 
         id36s_by_location = sgm(
-            g.cache, keys, miss_fn=_lookup, prefix=cls.CACHE_PREFIX,
-            stale=True, _update=update,
+            cache=g.gencache,
+            keys=keys,
+            miss_fn=_lookup,
+            prefix=cls.CACHE_PREFIX,
+            stale=True,
+            _update=update,
+            ignore_set_errors=True,
         )
         ids_by_location = {location: [int(id36, 36) for id36 in id36s]
                            for location, id36s in id36s_by_location.iteritems()}
@@ -2024,7 +2042,7 @@ class LocalizedDefaultSubreddits(tdb_cassandra.View):
 
         # update cache
         id36s = columns.keys()
-        g.cache.set_multi({rowkey: id36s}, prefix=cls.CACHE_PREFIX)
+        g.gencache.set_multi({rowkey: id36s}, prefix=cls.CACHE_PREFIX)
 
     @classmethod
     def set_global_srs(cls, srs):
@@ -2046,7 +2064,7 @@ class LocalizedDefaultSubreddits(tdb_cassandra.View):
         return cls.get_srids(cls.GLOBAL)
 
     @classmethod
-    def get_defaults(cls, location):
+    def get_localized_srs(cls, location):
         location_key = cls._rowkey(location) if location else None
         global_key = cls._rowkey(cls.GLOBAL)
         keys = filter(None, [location_key, global_key])
@@ -2058,6 +2076,26 @@ class LocalizedDefaultSubreddits(tdb_cassandra.View):
             return ids_by_location[location_key]
         else:
             return ids_by_location[global_key]
+
+
+class LocalizedDefaultSubreddits(BaseLocalizedSubreddits):
+    _use_db = True
+    _type_prefix = "LocalizedDefaultSubreddits"
+    CACHE_PREFIX = "defaultsrs:"
+
+    @classmethod
+    def get_defaults(cls, location):
+        return cls.get_localized_srs(location)
+
+
+class LocalizedFeaturedSubreddits(BaseLocalizedSubreddits):
+    _use_db = True
+    _type_prefix = "LocalizedFeaturedSubreddits"
+    CACHE_PREFIX = "featuredsrs:"
+
+    @classmethod
+    def get_featured(cls, location):
+        return cls.get_localized_srs(location)
 
 
 class LabeledMulti(tdb_cassandra.Thing, MultiReddit):

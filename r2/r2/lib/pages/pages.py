@@ -203,8 +203,10 @@ def responsive(res, space_compress=None):
 
 
 class Robots(Templated):
-    pass
 
+    def __init__(self, **context):
+        Templated.__init__(self, **context)
+        self.subreddit_sitemap = g.sitemap_subreddit_static_url
 
 class CrossDomain(Templated):
     pass
@@ -254,7 +256,8 @@ class Reddit(Templated):
                  header=True, srbar=True, page_classes=None, short_title=None,
                  show_wiki_actions=False, extra_js_config=None,
                  show_locationbar=False, auction_announcement=False,
-                 show_newsletterbar=False, **context):
+                 show_newsletterbar=False, canonical_link=None,
+                 **context):
         Templated.__init__(self, **context)
         self.title = title
         self.short_title = short_title
@@ -287,7 +290,9 @@ class Reddit(Templated):
         self.show_timeout_modal = False
 
         # generate a canonical link for google
-        self.canonical_link = request.fullpath
+        canonical_url = UrlParser(canonical_link or request.url)
+        canonical_url.canonicalize()
+        self.canonical_link = canonical_url.unparse()
         if c.render_style != "html":
             u = UrlParser(request.fullpath)
             u.set_extension("")
@@ -296,6 +301,7 @@ class Reddit(Templated):
             if g.domain_prefix:
                 u.hostname = "%s.%s" % (g.domain_prefix, u.hostname)
             self.canonical_link = u.unparse()
+
         # Generate a mobile link for Google.
         u = UrlParser(request.fullpath)
         u.switch_subdomain_by_extension('mobile')
@@ -351,7 +357,7 @@ class Reddit(Templated):
                 if self.show_newsletterbar:
                     self.newsletterbar = NewsletterBar()
 
-            if (c.render_style == "compact" and 
+            if (c.render_style == "compact" and
                     getattr(self, "show_mobilewebredirectbar", True)):
                 self.mobilewebredirectbar = MobileWebRedirectBar()
 
@@ -1003,7 +1009,7 @@ class Reddit(Templated):
 
     def build_popup_panes(self):
         panes = []
-         
+
         panes.append(Popup('archived-popup', ArchivedInterstitial()))
 
         if self.show_timeout_modal:
@@ -1012,7 +1018,7 @@ class Reddit(Templated):
                 hide_message=True,
             )
             panes.append(Popup('access-popup', popup_content))
-        
+
         return HtmlPaneStack(panes)
 
     def is_gold_page(self):
@@ -1334,7 +1340,7 @@ class PrefApps(Templated):
         res = editable_developer_fn.render(app, dev)
         return spaceCompress(res)
 
-    
+
 class PrefDeactivate(Templated):
     """Preference form for deactivating a user's own account."""
     def __init__(self):
@@ -2065,7 +2071,7 @@ class CommentPane(Templated):
         else:
             g.log.debug("using comment page cache")
             key = self.cache_key()
-            self.rendered = g.pagecache.get(key)
+            self.rendered = g.commentpanecache.get(key)
 
             if self.rendered:
                 cache_hit = True
@@ -2107,7 +2113,7 @@ class CommentPane(Templated):
                     c.user_is_loggedin = logged_in
 
                 try:
-                    g.pagecache.set(
+                    g.commentpanecache.set(
                         key,
                         self.rendered,
                         time=g.commentpane_cache_time
@@ -2241,6 +2247,8 @@ class SubredditsPage(Reddit):
             buttons.append(NamedButton("gold"))
         if c.user_is_admin:
             buttons.append(NamedButton("quarantine"))
+        if c.user_is_admin:
+            buttons.append(NamedButton("featured"))
         if c.user_is_loggedin:
             #add the aliases to "my reddits" stays highlighted
             buttons.append(NamedButton("mine",
@@ -3113,8 +3121,6 @@ class Thanks(Templated):
     def __init__(self, secret=None):
         if secret and secret.startswith("cr_"):
             status = "creddits"
-        elif g.cache.get("recent-gold-" + c.user.name):
-            status = "recent"
         elif c.user.gold:
             status = "gold"
         else:
@@ -3174,7 +3180,7 @@ class GoldPayment(Templated):
             user_creddits = 50
         else:
             user_creddits = c.user.gold_creddits
-            
+
         if (goldtype in ("gift", "code", "onetime") and
                 months <= user_creddits):
             can_use_creddits = True
@@ -4461,7 +4467,7 @@ class PromoteLinkBase(Templated):
         self.mobile_targeting_enabled = feature.is_enabled("mobile_targeting")
         Templated.__init__(self, **kw)
 
-    def get_locations(self): 
+    def get_locations(self):
         # geotargeting
         def location_sort(location_tuple):
             code, name, default = location_tuple
@@ -4568,7 +4574,7 @@ class PromoteLinkEdit(PromoteLinkBase):
         self.max_start = max_start.strftime("%m/%d/%Y")
         self.max_end = max_end.strftime("%m/%d/%Y")
         self.default_start = default_start.strftime("%m/%d/%Y")
-        self.default_end = default_end.strftime("%m/%d/%Y") 
+        self.default_end = default_end.strftime("%m/%d/%Y")
 
         self.link = link
         self.listing = listing
@@ -4651,7 +4657,7 @@ class RenderableCampaign(Templated):
         self.total_budget_dollars = campaign.total_budget_pennies / 100.
 
         if full_details:
-            if not self.campaign.is_house and not self.campaign.is_auction:            
+            if not self.campaign.is_house and not self.campaign.is_auction:
                 self.spent = promote.get_spent_amount(campaign)
             else:
                 self.spent = campaign.adserver_spent_pennies / 100.
@@ -4946,7 +4952,7 @@ class UserText(CachedTemplate):
 
         if text is None:
             text = ''
-            
+
         # set the attribute for admin takedowns
         if getattr(item, 'admin_takedown', False):
             admin_takedown = True
@@ -5369,7 +5375,7 @@ class PromoteReport(PromoteLinkBase):
             })
         crt = self.campaign_report_totals
         crt['total_clicks'] = crt['sr_clicks'] + crt['fp_clicks']
-        crt['total_imps'] = crt['sr_imps'] + crt['fp_imps']   
+        crt['total_imps'] = crt['sr_imps'] + crt['fp_imps']
         crt['bid'] = format_currency(crt['bid'], 'USD', locale=c.locale)
         # make the link report
         traffic_by_key = group_and_combine(
@@ -5528,8 +5534,9 @@ class LinkCommentsSettings(Templated):
             if self.stickied:
                 # always allow un-stickying things
                 self.can_sticky = True
-            elif not (link._deleted or link._spam):
-                self.can_sticky = True
+            # non deleted/spam self-posts by mods are eligible for stickying
+            else:
+                self.can_sticky = link.is_stickyable()
         self.sort = sort
         self.suggested_sort = suggested_sort
 
@@ -5769,7 +5776,7 @@ class ExploreItem(Templated):
             useful for comparing performance of data sources or algorithms
         sr and link are required
         comment is optional
-        
+
         See r2.lib.recommender for valid values of item_type and rec_src.
 
         """

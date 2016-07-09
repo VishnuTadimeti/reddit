@@ -139,6 +139,10 @@ function handleResponse(action) {
                     if (op == "call") 
                         objs[new_i] = objs[old_i].apply(objs[old_i]._obj, args);
                     else if (op == "attr") {
+                        // remove beforeunload event handler if exists for redirects
+                        if(args == 'redirect') {
+                          $(window).off('beforeunload');
+                        }
                         objs[new_i] = objs[old_i][args];
                         if(objs[new_i])
                             objs[new_i]._obj = objs[old_i];
@@ -200,13 +204,7 @@ $.request = function(op, parameters, worker_in, block, type,
          * and we dont warn the user on succesful form submissions
          */
         if($(form).length && res.success) {
-            $(window).off('beforeunload');
-
-            if(!$(form).hasClass('redirect-form')) {
-              $(form).one('keypress', function(e) {
-                r.warn_on_unload();
-              });
-            }
+          $(window).off('beforeunload');
         }
         return worker_in(res);
     };
